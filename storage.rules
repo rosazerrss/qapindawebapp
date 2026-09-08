@@ -1,0 +1,110 @@
+rules_version = '2';
+
+// ---------------------------------------------------------------------------
+// QAPINDA — Storage rules.
+//
+// Only images, only small ones, and only into the folder that belongs to you.
+// Menu photos are world-readable because the shopfront is public; everything
+// about *who* may replace them is decided by the restaurantId custom claim.
+// ---------------------------------------------------------------------------
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function role() {
+      return signedIn() ? request.auth.token.get('role', 'CUSTOMER') : '';
+    }
+
+    function restaurantId() {
+      return signedIn() ? request.auth.token.get('restaurantId', '') : '';
+    }
+
+    function isPlatform() {
+      return role() in ['OPERATOR', 'SUPER_ADMIN'];
+    }
+
+    /** Owners and managers may change the shopfront; kitchen staff may not. */
+    function canEditRestaurant(id) {
+      return isPlatform()
+             || (role() in ['RESTAURANT_OWNER', 'RESTAURANT_MANAGER'] && restaurantId() == id);
+    }
+
+    function isImage() {
+      return request.resource.contentType.matches('image/(jpeg|png|webp|avif)');
+    }
+
+    function underMB(limit) {
+      return request.resource.size < limit * 1024 * 1024;
+    }
+
+    // Restaurant logo, cover photo and dish images. Public to read.
+    match /restaurants/{id}/{allPaths=**} {
+      allow read: if true;
+      allow write: if canEditRestaurant(id) && isImage() && underMB(5);
+    }
+
+    // A customer's own avatar.
+    match /users/{userId}/avatar/{fileName} {
+      allow read: if true;
+      allow write: if signedIn() && request.auth.uid == userId && isImage() && underMB(2);
+    }
+
+    /**
+     * Photos attached to a complaint.
+     *
+     * Written by the customer whose complaint it is, under their own uid so the
+     * rule needs nothing but the path. Readable by anyone signed in, because the
+     * restaurant that must look at the picture is a different account and the
+     * URL is unguessable — a rule that could name "the restaurant on that order"
+     * would have to read Firestore, which storage rules cannot do.
+     *
+     * A cold chip photographed at midnight is not sensitive data; the customer's
+     * name and number, which are, stay in Firestore where the rules are precise.
+     */
+    match /complaints/{userId}/{fileName} {
+      allow read: if signedIn();
+      allow write: if signedIn() && request.auth.uid == userId && isImage() && underMB(4);
+    }
+
+    /**
+     * Photographs attached to a support message.
+     *
+     * The same shape as complaints, and for the same reasons: written under the
+     * sender's own uid so the path is the rule, readable by anyone signed in
+     * because the operator who has to look at the picture is a different
+     * account and a storage rule cannot read Firestore to find out which
+     * ticket a file belongs to.
+     *
+     * The URL is unguessable, and what is in these pictures is a receipt, a
+     * wrong dish, a screenshot of an error. The things that are genuinely
+     * sensitive — who complained, their number, which order — stay in
+     * Firestore, where the rules can be precise about them.
+     *
+     * Restaurant staff and operators write here too, not only customers: a
+     * kitchen answering "which item was missing?" with a photograph of the bag
+     * it packed is the fastest way to end that conversation.
+     */
+    match /support/{userId}/{fileName} {
+      allow read: if signedIn();
+      allow write: if signedIn() && request.auth.uid == userId && isImage() && underMB(4);
+    }
+
+    // Licence and tax documents from a restaurant application. Never public:
+    // these are the applicant's legal papers, not marketing material.
+    match /applications/{userId}/{fileName} {
+      allow read: if signedIn() && (request.auth.uid == userId || isPlatform());
+      allow write: if signedIn()
+                   && request.auth.uid == userId
+                   && underMB(10)
+                   && (isImage() || request.resource.contentType == 'application/pdf');
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

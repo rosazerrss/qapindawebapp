@@ -1,0 +1,853 @@
+rules_version = '2';
+
+// ---------------------------------------------------------------------------
+// QAPINDA — Firestore Security Rules
+//
+// The governing idea: the client writes almost nothing. Orders, prices,
+// commission, coupons, roles and the ledger are all written by Cloud Functions
+// running with admin privileges, which bypass these rules entirely. What is
+// written here is therefore mostly a *read* policy plus a very short list of
+// harmless self-service writes.
+//
+// The two boundaries that matter most:
+//   1. TENANT — a restaurant may only ever see its own orders, menu and money.
+//      Every check goes through restaurantId(), which reads a custom claim, not
+//      a field the client sent.
+//   2. MONEY — nothing a customer or a restaurant can write may change what an
+//      order costs, what commission is owed, or what a coupon is worth.
+// ---------------------------------------------------------------------------
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // -----------------------------------------------------------------------
+    // Identity helpers. Roles come from custom claims set by Cloud Functions —
+    // never from a Firestore field the user could have written.
+    // -----------------------------------------------------------------------
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function uid() {
+      return request.auth.uid;
+    }
+
+    function role() {
+      return signedIn() ? request.auth.token.get('role', 'CUSTOMER') : '';
+    }
+
+    function restaurantId() {
+      return signedIn() ? request.auth.token.get('restaurantId', '') : '';
+    }
+
+    function isPlatform() {
+      return role() in ['OPERATOR', 'SUPER_ADMIN'];
+    }
+
+    function isSuperAdmin() {
+      return role() == 'SUPER_ADMIN';
+    }
+
+    function isRestaurantStaff() {
+      return role() in ['RESTAURANT_OWNER', 'RESTAURANT_MANAGER', 'RESTAURANT_STAFF'];
+    }
+
+    function isOwnerOrManager() {
+      return role() in ['RESTAURANT_OWNER', 'RESTAURANT_MANAGER'];
+    }
+
+    /** The tenant gate: staff of exactly this restaurant, or platform staff. */
+    function ownsRestaurant(id) {
+      return isPlatform() || (isRestaurantStaff() && restaurantId() == id);
+    }
+
+    /** Fields an update is allowed to touch, and nothing else. */
+    function onlyChanges(fields) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(fields);
+    }
+
+    /** Whether this write moves one named field. */
+    function changed(field) {
+      return field in request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    // -----------------------------------------------------------------------
+    // users — private. A person sees themselves; platform staff see everyone.
+    // -----------------------------------------------------------------------
+
+    match /users/{userId} {
+      // A person sees themselves; platform staff see everyone; and an owner or
+      // manager sees the people who work for their own restaurant — otherwise
+      // the staff screen has no way to list the team it just added to.
+      //
+      // This is a *list* rule as much as a get rule: Firestore evaluates it
+      // against the query, so the staff page must filter on
+      // `restaurantId == <own>` for it to be allowed at all. It cannot become a
+      // way to read anybody else, because a user document only carries a
+      // restaurantId once that restaurant put it there.
+      allow read: if signedIn() && (
+                    uid() == userId
+                    || isPlatform()
+                    || (isOwnerOrManager()
+                        && resource.data.get('restaurantId', '') == restaurantId())
+                  );
+
+      // Creation goes through the registerAccount function, which claims the
+      // phone and email locks in the same transaction. Letting the client
+      // create its own user document would be the duplicate-account loophole.
+      allow create: if false;
+
+      // A person may change their language and their default address, and
+      // nothing else. Role, restaurantId, accountStatus, phone, email,
+      // riskFlags and the order counters are all server territory — a customer
+      // who could set role would be an admin.
+      //
+      // `fullName` USED TO BE ON THIS LIST AND IS DELIBERATELY NOT ANY MORE.
+      // A language is a preference; a name LEAVES the account — it is printed
+      // on the kitchen's ticket and shown to the courier. Written straight from
+      // the browser it had no length limit, no moderation and no audit trail.
+      // It now goes through `updateProfile`, which trims it, bounds it, runs the
+      // same filter as reviews and records what it was before.
+      allow update: if signedIn()
+                    && uid() == userId
+                    && onlyChanges(['locale', 'defaultAddressId', 'updatedAt']);
+
+      allow delete: if false;
+
+      /*
+       * A person's saved addresses. Readable by their owner; WRITTEN ONLY BY
+       * THE SERVER.
+       *
+       * This used to say `allow read, write` and the reasoning was that an
+       * address book is not financial, so a bad write could only damage the
+       * writer's own data. That reasoning was wrong twice over, because the
+       * server READS this document and believes it:
+       *
+       *   • `phoneVerified` decides whether a courier may be sent to that
+       *     number. Writable from the browser, it is a way to put a stranger's
+       *     telephone number on a delivery and have a driver ring them — the
+       *     exact thing the whole SMS-code flow in `addressPhone.ts` exists to
+       *     prevent, undone by one line.
+       *   • `lat`/`lng` are what `createOrder` measures the delivery radius and
+       *     the delivery fee against. A pin moved onto the restaurant's own
+       *     coordinates makes every delivery free and inside every zone.
+       *
+       * So: reads stay open to the owner, writes go through `saveAddress`,
+       * which validates the coordinates, keeps the one-default rule, computes
+       * the address hash used for coupon limits, and refuses to set
+       * `phoneVerified` itself.
+       */
+      match /addresses/{addressId} {
+        allow read: if signedIn() && uid() == userId;
+        allow write: if false;
+      }
+
+      // Favourites: a private shortlist. No money, no other person's data.
+      match /favourites/{favouriteId} {
+        allow read, write: if signedIn() && uid() == userId;
+      }
+    }
+
+    // The uniqueness locks. No client ever touches these — being able to read
+    // them would turn the index into a phone-number directory, and being able
+    // to write them would let someone squat on another person's number.
+    match /phoneIndex/{phone} {
+      allow read, write: if false;
+    }
+    match /emailIndex/{email} {
+      allow read, write: if false;
+    }
+
+    // -----------------------------------------------------------------------
+    // restaurants — the public shopfront.
+    // -----------------------------------------------------------------------
+
+    match /restaurants/{id} {
+      // A guest may browse. Only approved restaurants are visible; a draft or
+      // rejected application stays with its owner and the platform.
+      //
+      // For a list query this is provable only because every such query filters
+      // on `status == 'ACTIVE'` — see `listRestaurants`. A query without that
+      // filter is denied, which is the intended behaviour.
+      allow read: if resource.data.status == 'ACTIVE' || ownsRestaurant(id);
+
+      allow create, delete: if false;
+
+      // Opening and pausing the shop is the one live control the restaurant
+      // needs at the till. Commission, status and ratings are not here.
+      allow update: if ownsRestaurant(id)
+                    && isOwnerOrManager()
+                    && onlyChanges(['serviceState', 'updatedAt']);
+
+      // Commission rate, legal name, contact details, response window — and
+      // the bank account the restaurant is paid into.
+      //
+      // Narrowed to the owner, the manager and the platform: a kitchen account
+      // has no reason to see the IBAN the month's payout lands in, and the
+      // people who might change it are exactly the people who could redirect
+      // it. Written only by Cloud Functions, which validate the IBAN's check
+      // digits and refuse anything shaped like a card number.
+      /*
+       * `isSuperAdmin()`, not `isPlatform()` — the same correction already made
+       * on `ledgerEntries` and `settlements`, which was never carried here.
+       *
+       * An operator is support staff: often outsourced, often temporary, and
+       * the account most likely to be shared or phished. This document holds
+       * the commission rate, the legal name, the tax id and the IBAN the
+       * month's payout lands in. `PLATFORM_VIEW_LEDGER` was deliberately taken
+       * away from OPERATOR in `shared/permissions.ts`; leaving `isPlatform()`
+       * here handed the same information back through a side door that no
+       * screen renders but any console can read.
+       */
+      match /private/{document} {
+        allow read: if isSuperAdmin() || (isOwnerOrManager() && restaurantId() == id);
+        allow write: if false;
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // Menu — publicly readable, server-written.
+    //
+    // Menu edits go through Cloud Functions so that price changes are
+    // validated and audited. "Easy for the restaurant" is a UI problem, not a
+    // reason to let a browser write prices directly.
+    // -----------------------------------------------------------------------
+
+    match /menuCategories/{categoryId} {
+      allow read: if resource.data.visible == true
+                  || ownsRestaurant(resource.data.restaurantId);
+      allow write: if false;
+    }
+
+    /*
+     * restaurantInvites — "come and work here", awaiting an answer.
+     *
+     * Two readers and no writers. The person the offer is addressed to has to
+     * see it in order to answer it, and the restaurant that made it has to see
+     * that it is outstanding. Everything that changes one goes through a
+     * callable: accepting an invitation assigns a role and a `restaurantId`
+     * claim, which is the tenant boundary, and no browser may write that.
+     *
+     * The document deliberately holds no name and no telephone number — see
+     * `RestaurantInvite` — so a restaurant's whole staff-managing team reading
+     * it learns nothing about a person who may yet say no.
+     */
+    match /restaurantInvites/{inviteId} {
+      allow read: if signedIn()
+                  && (uid() == resource.data.uid || ownsRestaurant(resource.data.restaurantId));
+      allow write: if false;
+    }
+
+    match /products/{productId} {
+      /*
+       * Two conditions, and the second one is new.
+       *
+       * `availability != 'HIDDEN'` was the whole rule, and it hid a dish the
+       * restaurant had taken off the menu. It did not hide the dishes of a
+       * restaurant the PLATFORM had taken off — suspending a shop hid its card,
+       * its page and its search results, but its menu stayed readable to anyone
+       * who queried products by a restaurantId, and a restaurantId is in every
+       * URL that shop ever had.
+       *
+       * `restaurantVisible` is mirrored from the restaurant's status onto each
+       * dish when that status changes. It is stored rather than looked up here
+       * because `get(/databases/.../restaurants/…)` inside a rule costs a
+       * document read PER PRODUCT EVALUATED, and a menu is one query of up to
+       * four hundred.
+       *
+       * `get('restaurantVisible', true)`, and the default is the entire point.
+       *
+       * THIS LINE WAS WRITTEN AS `resource.data.restaurantVisible != false` AND
+       * IT TOOK EVERY MENU ON THE PLATFORM DARK.
+       *
+       * In Firestore rules, reading a key that is not on the document is not
+       * `null` and is not `undefined` — it is an ERROR, and an error in a rule
+       * denies the request. Every dish saved before this field existed has no
+       * such key, so the condition did not evaluate to "true, absent means
+       * visible" as intended. It threw, and the whole menu query was refused:
+       * the restaurant page loaded and said "Burada hələ heç nə yoxdur".
+       *
+       * `get(key, default)` is the form that tolerates an absent key — the same
+       * form this file already uses for `restaurantId` and `courier`. The
+       * default is `true`, so a dish written before the flag existed reads as
+       * visible and nothing goes dark; only an explicit `false`, written when a
+       * restaurant is suspended, closes it.
+       */
+      allow read: if (resource.data.availability != 'HIDDEN'
+                      && resource.data.get('restaurantVisible', true) != false)
+                  || ownsRestaurant(resource.data.restaurantId);
+      allow write: if false;
+    }
+
+    // -----------------------------------------------------------------------
+    // orders — the heart of it. Read by the three parties, written by no one.
+    // -----------------------------------------------------------------------
+
+    match /orders/{orderId} {
+      /*
+       * Three readers, and the third is deliberately narrow.
+       *
+       * A courier is a restaurant account, but it is NOT restaurant staff:
+       * `isRestaurantStaff()` lists the three roles that may act for the
+       * restaurant, and RESTAURANT_COURIER is not among them. So a courier
+       * reaches an order only by being the courier written on it. That is the
+       * whole privacy design — this account rides around on a personal phone,
+       * and the customer addresses it can reach must be the ones it was given,
+       * not every address the restaurant has ever delivered to.
+       */
+      /*
+       * Split into `get` and `list` on purpose, and the difference is the
+       * courier clause.
+       *
+       * Fetching one order is answered against that document, so the courier
+       * clause has to be defensive: most orders have no courier at all, and
+       * reaching into a null field is an error, which Firestore treats as a
+       * denial — including for a reader who would have passed on a later
+       * clause. Hence the `get('courier', null)` guard below.
+       *
+       * A query is not answered that way. Firestore judges a `list` against
+       * the query's own constraints, so every clause has to be something it
+       * can match to a `where`. `where('courier.id', '==', uid)` matches a
+       * plain equality on `resource.data.courier.id` and matches nothing at
+       * all through a `get()` call — which is why the courier's own screen
+       * could ask for its deliveries and be refused. The predicate is
+       * identical; only the spelling changes, and the null case cannot arise
+       * because the query that reaches this clause has already excluded it.
+       *
+       * The courier app makes exactly two list queries, and both carry that
+       * equality: the active deliveries and the driver's own history — see
+       * `src/services/courier.ts`, where there is deliberately no function
+       * that can be called without a courier id. They differ only in which
+       * statuses the `in` filter names, so one composite index
+       * (`courier.id`, `status`, `placedAt` DESC) serves them both. Courier A
+       * cannot reach courier B's list by any spelling: a query without the
+       * filter is refused outright rather than silently widened, and one with
+       * somebody else's uid in it is refused by this clause.
+       */
+      allow get: if signedIn() && (
+                   uid() == resource.data.customerId
+                   || ownsRestaurant(resource.data.restaurantId)
+                   || (resource.data.get('courier', null) != null
+                       && uid() == resource.data.courier.id)
+                 );
+
+      allow list: if signedIn() && (
+                    uid() == resource.data.customerId
+                    || ownsRestaurant(resource.data.restaurantId)
+                    || uid() == resource.data.courier.id
+                  );
+
+      /*
+       * Every status change goes through updateOrderStatus, which runs the
+       * state machine, writes the event trail and posts the ledger entry. A
+       * direct write here could mark an order delivered without any of that.
+       *
+       * WHO MAY PLACE AN ORDER AT ALL: only a CUSTOMER. Not a restaurant
+       * owner, manager or staff member, not a RESTAURANT_COURIER, not an
+       * OPERATOR, not a SUPER_ADMIN — and not a restaurant ordering from its
+       * own shop. That rule is not spelled as a role clause here, and the
+       * absence is deliberate rather than an oversight: `create: if false`
+       * already refuses EVERY client, whatever role it holds, so a role clause
+       * would be a second, weaker copy of a rule that is enforced where orders
+       * are actually made — `createOrder` in `functions/src/orders/create.ts`,
+       * which re-reads the role from the stored user document and refuses
+       * anything that is not a customer. The customer's own screens hide the
+       * cart for those accounts as a courtesy; this line and that callable are
+       * the two places where it is a fact.
+       */
+      allow create, update, delete: if false;
+
+      // Append-only trail. Readable by the same three parties, writable by none.
+      match /events/{eventId} {
+        /*
+         * One document read, reused — a rule that reads the parent twice pays
+         * for it twice on every listener tick.
+         *
+         * THE COURIER CLAUSE WAS MISSING, AND IT WAS AN OVERSIGHT.
+         *
+         * The parent order admits three readers: the customer, the restaurant,
+         * and the courier written on that order. This rule listed two. Nothing
+         * visibly broke, because no courier screen draws a timeline — but a
+         * driver who can open an order and not read what happened to it is a
+         * gap left by forgetting, not a decision, and the next screen built for
+         * them would have failed for a reason nobody could find.
+         *
+         * `get('courier', null)` guards the common case: most orders have no
+         * courier at all, and reaching into a null field is an error, which
+         * Firestore treats as a denial — including for the customer, who would
+         * have passed on the first clause.
+         */
+        function canReadParent() {
+          let order = get(/databases/$(database)/documents/orders/$(orderId)).data;
+          return uid() == order.customerId
+                 || ownsRestaurant(order.restaurantId)
+                 || (order.get('courier', null) != null && order.courier.id == uid());
+        }
+
+        allow read: if signedIn() && canReadParent();
+        allow write: if false;
+      }
+
+      // IP, device fingerprint, fraud flags. Platform only — the restaurant has
+      // no business seeing a customer's device history.
+      match /private/{document} {
+        allow read: if isPlatform();
+        allow write: if false;
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // coupons — deliberately unreadable.
+    //
+    // If a customer could list this collection they would have every unreleased
+    // campaign code. Validation happens in the applyCoupon callable, which
+    // answers only "is this code valid for this cart, and worth how much".
+    // -----------------------------------------------------------------------
+
+    /*
+     * `isSuperAdmin()` here too, matching `PLATFORM_MANAGE_COUPONS`, which an
+     * operator does not hold. An operator who could list this collection would
+     * have every unreleased campaign code before it launched — the same leak
+     * this comment block warns about for customers, one role higher up.
+     */
+    match /coupons/{couponId} {
+      allow read: if isSuperAdmin();
+      allow write: if false;
+    }
+
+    /*
+     * Redemptions carry `phone`, `deviceId` and `addressHash` — the anti-fraud
+     * fingerprints. They belong with the money, not with support.
+     */
+    match /couponRedemptions/{redemptionId} {
+      allow read: if isSuperAdmin();
+      allow write: if false;
+    }
+
+    // -----------------------------------------------------------------------
+    // Money. Immutable by construction — no client write path exists at all.
+    // -----------------------------------------------------------------------
+
+    // Commission, platform-funded discounts, the online takings the platform is
+    // holding on a restaurant's behalf, and the payments that settle the
+    // balance — every one of them is written by a Cloud Function and by nothing
+    // else. There is no client write path here at all, which is why the ledger
+    // can be trusted as the record: a restaurant that could post its own
+    // PAYMENT_RECEIVED entry could clear its own invoice.
+    //
+    // A restaurant may read its own entries. Firestore evaluates this against
+    // the *query*, so any listing must filter on
+    // `restaurantId == <own restaurant>` — a query without it is denied, which
+    // is the intended behaviour rather than an oversight.
+    match /ledgerEntries/{entryId} {
+      // `isSuperAdmin()`, not `isPlatform()`. An operator works support, and
+      // support has no business reading what every restaurant on the platform
+      // owes — the same line drawn in `ROLE_PERMISSIONS`, drawn again here so
+      // that removing a permission from a callable cannot be walked around by
+      // querying the collection from a browser console.
+      allow read: if isSuperAdmin() || (
+                    isRestaurantStaff()
+                    && isOwnerOrManager()
+                    && restaurantId() == resource.data.restaurantId
+                  );
+      allow write: if false;
+    }
+
+    // Same for the month's rolled-up invoice — including when it is negative,
+    // which is the ordinary case for a restaurant whose customers pay online.
+    match /settlements/{settlementId} {
+      // Same line as `ledgerEntries` above, for the same reason.
+      allow read: if isSuperAdmin() || (
+                    isRestaurantStaff()
+                    && isOwnerOrManager()
+                    && restaurantId() == resource.data.restaurantId
+                  );
+      allow write: if false;
+    }
+
+    // -----------------------------------------------------------------------
+    // Notifications — the only field any client may write anywhere.
+    // -----------------------------------------------------------------------
+
+    match /notifications/{notificationId} {
+      /*
+       * Two readers, and the second one is narrower than it looks.
+       *
+       * `restaurantId` is on almost every notification in the system, because
+       * that is how the operator's desk finds them: a customer's "your order is
+       * on its way" carries the restaurant that is cooking, and a courier's
+       * "this delivery was cancelled" carries the shop they ride for. So a rule
+       * that granted the restaurant everything with its own id on it handed the
+       * kitchen the customer's inbox and every driver's phone — which is what
+       * this clause used to do.
+       *
+       * The `role` field is what actually says whose notification it is: it is
+       * the recipient's role at the moment of writing, and `roleAudience()` in
+       * `shared/notifications.ts` is the authority on which panel that puts it
+       * in. A restaurant may read the three roles that *are* the restaurant.
+       * A courier's notifications are readable by that courier alone, through
+       * the first clause and by nothing else — not by the restaurant they ride
+       * for, and not by the driver on the next moped.
+       *
+       * Platform staff get no clause of their own. An operator and an admin
+       * read their own notifications like everybody else; what they are
+       * entitled to see of anyone else's goes through a callable that can
+       * decide field by field.
+       *
+       * Firestore judges a list against the QUERY, so the restaurant's own bell
+       * must filter on `restaurantId == <own>` AND `role in [the three]` — see
+       * `watchRestaurantNotifications` in `src/services/notifications.ts`, which
+       * is written that way. A query missing either is denied, which is the
+       * intended behaviour.
+       */
+      allow read: if signedIn() && (
+                    uid() == resource.data.userId
+                    || (isRestaurantStaff()
+                        && restaurantId() != ''
+                        && restaurantId() == resource.data.restaurantId
+                        && resource.data.role in [
+                             'RESTAURANT_OWNER',
+                             'RESTAURANT_MANAGER',
+                             'RESTAURANT_STAFF'
+                           ])
+                  );
+
+      /*
+       * Two things the recipient — and nobody else — may write on their own
+       * notification.
+       *
+       * 1. THAT THEY READ IT. `read` is the flag the bell counts and `readAt`
+       *    is when it happened; `AppNotification` requires both to move
+       *    together, and `status` is the same fact spelled as a word for the
+       *    notification log. The old rule named only `read`, which meant every
+       *    honest write of the pair was refused.
+       *
+       * 2. THAT IT ARRIVED. `deliveryStatus` is the one field on a notification
+       *    that a server cannot honestly fill in: the server knows it wrote the
+       *    document, not that anybody ever collected it, and "the restaurant
+       *    says it never got the order" is exactly the question that difference
+       *    answers. So the session that actually received it says so, and may
+       *    only ever say `sent` — a client cannot mark somebody's notification
+       *    failed, and cannot un-send one. `title` and `body` travel with it as
+       *    the log's record of the sentence that was really shown, in the
+       *    language it was really shown in; `titleKey` and `bodyKey` are
+       *    immutable here and remain what every screen renders.
+       */
+      allow update: if signedIn()
+                    && uid() == resource.data.userId
+                    && onlyChanges([
+                         'read', 'readAt', 'status',
+                         'deliveryStatus', 'deliveredAt', 'title', 'body'
+                       ])
+                    // Each of the three constrained fields is checked only when
+                    // the write actually moves it. A person marking an old
+                    // notification read must not be refused because a document
+                    // written before this field existed has no `deliveryStatus`
+                    // on it at all.
+                    && (!changed('status')
+                        || request.resource.data.status in ['UNREAD', 'READ'])
+                    && (!changed('deliveryStatus')
+                        || request.resource.data.deliveryStatus == 'sent')
+                    && (!changed('title') || request.resource.data.title is string)
+                    && (!changed('body') || request.resource.data.body is string);
+
+      allow create, delete: if false;
+    }
+
+    // -----------------------------------------------------------------------
+    // Audit, consent, settings, internals.
+    // -----------------------------------------------------------------------
+
+    // Append-only, and not even a super admin may edit or delete an entry from
+    // the client. There is no hidden bypass.
+    match /auditLogs/{logId} {
+      allow read: if isPlatform();
+      allow write: if false;
+    }
+
+    match /consents/{consentId} {
+      allow read: if signedIn() && (uid() == resource.data.userId || isPlatform());
+      allow write: if false;
+    }
+
+    match /systemSettings/{document} {
+      // Delivery city, support phone, legal placeholders — a guest needs these
+      // before they have an account.
+      allow read: if document == 'public' || isSuperAdmin();
+      allow write: if false;
+    }
+
+    /**
+     * Reviews.
+     *
+     * Readable by anyone — a rating nobody can read is not a rating. Writable by
+     * nobody: `submitReview` checks that the order exists, is yours and was
+     * delivered, and folds the rating into the restaurant's average in the same
+     * transaction. A client write would bypass all three.
+     *
+     * CLOSED TO DIRECT READS, and the last sentence of the paragraph above is
+     * why it can be: no screen queries this collection. Every rating on every
+     * page comes from `listReviews`, which strips `customerId` before it
+     * answers and filters hidden reviews out of the list.
+     *
+     * `allow read: if true` was the previous rule, and it undid both of those
+     * protections for anyone willing to open a console:
+     *
+     *   • a hidden review — hidden because it was abusive, or because it named
+     *     somebody — was still fetchable by id, and listable in bulk;
+     *   • every review carried `customerId`, so the public star ratings on a
+     *     restaurant page could be joined back into "this account eats here,
+     *     on these dates". The callable was carefully stripping a field that
+     *     the rules were handing out beside it.
+     *
+     * Closing the collection costs nothing, because nothing was reading it.
+     */
+    match /reviews/{reviewId} {
+      allow read, write: if false;
+    }
+
+    /**
+     * Complaints. Server only, in both directions.
+     *
+     * Not even the customer who filed one may read it back directly: the
+     * document carries their full name and phone for the restaurant to call,
+     * and `listComplaints` decides who sees which fields.
+     */
+    match /complaints/{complaintId} {
+      allow read, write: if false;
+    }
+
+    /**
+     * Support tickets.
+     *
+     * THE LANE IS THE BOUNDARY, AND IT IS ENFORCED HERE TOO
+     * ----------------------------------------------------
+     * Three lanes, and one of them an operator may never open:
+     * RESTAURANT_TO_ADMIN is where a restaurant writes about commission, the
+     * contract, or an operator who handled them badly. Excluding operators
+     * from it in the app would be theatre — a person cannot be asked to
+     * forward a complaint about themselves — so the exclusion is written into
+     * the rule, into `shared/supportState.ts` and into every callable.
+     *
+     * A COURIER HAS NO CLAUSE HERE AT ALL
+     * -----------------------------------
+     * `isRestaurantStaff()` names the three roles that act for a restaurant
+     * and RESTAURANT_COURIER is not one of them, so a courier matches nothing
+     * below and reaches no ticket in any lane. That is the whole design: a
+     * courier's problem goes through the restaurant they ride for, and this
+     * account rides around town on a personal phone.
+     *
+     * EVERY LIST QUERY MUST CARRY THE FILTERS ITS CLAUSE NAMES
+     * -------------------------------------------------------
+     * Firestore evaluates this against the *query*, not against the documents
+     * it would return. So a customer's own list must filter on
+     * `customerId == <uid>` **and** `lane == 'CUSTOMER_TO_OPERATOR'`, and a
+     * restaurant's on `restaurantId == <own>` and the two restaurant lanes —
+     * see `src/services/support.ts`, where both are written that way. A query
+     * missing either filter is denied, which is the intended behaviour rather
+     * than an oversight: without the lane filter a customer's query would
+     * otherwise have to be proven against a field the rule cannot see.
+     *
+     * Platform staff DO list through here, and that is a change. The operator
+     * inbox used to go through `listSupportTickets` on the belief that its
+     * query was the unscoped read this refuses. It is not: `operatorMayRead`
+     * names `lane in [...]`, and a query carrying exactly that `in` filter
+     * proves itself against this clause the same way a customer's own list
+     * does — so the inbox is a live subscription and an operator no longer
+     * reloads the page to see a new ticket. An admin passes on `isSuperAdmin`
+     * regardless of the filter. `watchInboxTickets` in
+     * `src/services/support.ts` is the one query, and it must never lose that
+     * lane filter: without it the whole subscription is refused.
+     *
+     * Written only by the callables, in both directions. A message, the unread
+     * counters, the queue summary and the status all have to land in the same
+     * transaction or the badges and the queues start lying.
+     */
+    match /supportTickets/{ticketId} {
+      function inLane(lane) {
+        return resource.data.lane == lane;
+      }
+
+      /** The two lanes an operator works. Never the admin lane. */
+      function operatorMayRead() {
+        return role() == 'OPERATOR'
+               && resource.data.lane in ['CUSTOMER_TO_OPERATOR', 'RESTAURANT_TO_OPERATOR'];
+      }
+
+      /** The customer who raised it, and nobody else's customer ticket. */
+      function myCustomerTicket() {
+        return inLane('CUSTOMER_TO_OPERATOR') && uid() == resource.data.customerId;
+      }
+
+      /**
+       * A restaurant's own ticket, in either restaurant lane.
+       *
+       * The lane check is not redundant: a customer's ticket about an order
+       * also carries that order's `restaurantId`, so that an operator can see
+       * who cooked the meal without opening the order. Without this clause the
+       * restaurant would be able to read the customer's side of it.
+       */
+      function myRestaurantTicket() {
+        return isRestaurantStaff()
+               && restaurantId() != ''
+               && restaurantId() == resource.data.restaurantId
+               && !inLane('CUSTOMER_TO_OPERATOR');
+      }
+
+      allow read: if signedIn() && (
+                    isSuperAdmin()
+                    || operatorMayRead()
+                    || myCustomerTicket()
+                    || myRestaurantTicket()
+                  );
+
+      allow write: if false;
+
+      /**
+       * The messages inside one ticket.
+       *
+       * Answered against the parent rather than against fields copied onto
+       * each message, the same way an order's event trail is: one document
+       * read, reused, and a predicate that reads identically for `get` and for
+       * `list` because it never touches `resource.data` of the message itself.
+       */
+      match /messages/{messageId} {
+        function canReadTicket() {
+          let ticket = get(/databases/$(database)/documents/supportTickets/$(ticketId)).data;
+          return isSuperAdmin()
+                 || (role() == 'OPERATOR'
+                     && ticket.lane in ['CUSTOMER_TO_OPERATOR', 'RESTAURANT_TO_OPERATOR'])
+                 || (ticket.lane == 'CUSTOMER_TO_OPERATOR' && uid() == ticket.customerId)
+                 || (isRestaurantStaff()
+                     && restaurantId() != ''
+                     && restaurantId() == ticket.restaurantId
+                     && ticket.lane != 'CUSTOMER_TO_OPERATOR');
+        }
+
+        allow read: if signedIn() && canReadTicket();
+        allow write: if false;
+      }
+    }
+
+    /**
+     * Geri bildirim — one closed ticket, in the customer's own settings.
+     *
+     * Readable by the account it names and by nobody else, not even the
+     * restaurant the ticket was about: it carries the customer's own words
+     * back to them, and a rating of how support handled it is not the
+     * restaurant's business.
+     *
+     * Written only by the server. The entry is created inside the transaction
+     * that closes the ticket and the rating goes through `rateSupportFeedback`,
+     * because the rating has to land on the retained ticket in the same breath
+     * — a client write here could record a rating that the ticket never got,
+     * and the ticket is the copy that survives this document being deleted.
+     *
+     * Read is evaluated against the QUERY, so the screen must filter on
+     * `userId == <me>`; anything wider is refused before a document is read.
+     */
+    match /supportFeedback/{feedbackId} {
+      allow read: if signedIn() && uid() == resource.data.userId;
+      allow write: if false;
+    }
+
+    /**
+     * The pre-ticket support threads.
+     *
+     * The design was one permanent thread per restaurant; it is now tickets,
+     * and `migrateSupportConversations` carried every one of these across with
+     * its messages. Nothing writes here any more and no screen reads it, but
+     * the documents are retained rather than deleted — so the read rule stays
+     * exactly as narrow as it was, and the write rule stays shut.
+     */
+    match /conversations/{restaurantId} {
+      allow read: if isPlatform() || ownsRestaurant(restaurantId);
+      allow write: if false;
+
+      match /messages/{messageId} {
+        allow read: if isPlatform() || ownsRestaurant(restaurantId);
+        allow write: if false;
+      }
+    }
+
+    /**
+     * Push tokens — closed to every client, in both directions.
+     *
+     * WRITING is refused because the FCM registration token is the document id:
+     * a browser able to create one could register somebody else's telephone
+     * against its own account and be sent their orders — codes, links,
+     * addresses. No rule can catch that, because from here it looks like a
+     * signed-in person creating a row with their own uid on it. Registration
+     * goes through `registerPushToken`, which claims the token for the caller.
+     *
+     * READING is refused because the collection is a list of every device every
+     * account owns. Nothing in the app needs it; the Cloud Functions bypass
+     * these rules and are the only reader.
+     */
+    match /pushTokens/{token} {
+      allow read, write: if false;
+    }
+
+    match /idempotencyKeys/{key} {
+      allow read, write: if false;
+    }
+
+    /*
+     * How often each account has called each function.
+     *
+     * Closed to every client, like the two collections around it. Reading it
+     * would tell an attacker exactly how much budget is left before the refusal
+     * — which is the one piece of information a rate limit exists to withhold.
+     */
+    match /rateLimits/{key} {
+      allow read, write: if false;
+    }
+
+    /*
+     * The words people search for and then open something from.
+     *
+     * PUBLICLY READABLE, and that is the point: the chips on the search screen
+     * are these documents, read straight from the browser, so the screen costs
+     * one small query rather than a callable and a cold start.
+     *
+     * What is public is a folded word and a number. No uid, no order, no
+     * account is attached to a row — the collection cannot say who searched for
+     * anything, only that some number of people did. That is the whole reason
+     * it is safe to open.
+     *
+     * Writes are the server's alone. A client that could write here could put
+     * any word it liked in front of every customer on the platform.
+     */
+    match /searchTerms/{term} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    match /deviceSignals/{deviceId} {
+      allow read, write: if false;
+    }
+
+    // Pending email codes. Hashed, and unreadable even by their owner: being
+    // able to read your own document would hand you the hash to attack.
+    match /emailVerifications/{uid} {
+      allow read, write: if false;
+    }
+
+    // The pending codes for a delivery address's telephone number.
+    //
+    // Server only, like the email codes above and for the same reason: these
+    // documents hold a hash, an attempt count and a daily counter, and a client
+    // that could read them could count attempts for somebody else, while a
+    // client that could write them could reset its own limit or mark a number
+    // verified without ever receiving a message.
+    match /addressVerifications/{id} {
+      allow read, write: if false;
+    }
+
+    // Anything not named above does not exist as far as a client is concerned.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
